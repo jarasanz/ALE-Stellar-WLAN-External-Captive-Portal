@@ -34,7 +34,7 @@ Stellar AP (Gateway)
 - SQLite (state and logs)
 
 ### Network
-- ALE Stellar AP (Standalone or Controller mode)
+- ALE Stellar AP (Standalone or OmniVista mode)
 - RADIUS Authentication: UDP/1812
 - RADIUS Accounting: UDP/1813
 - Portal: HTTP (port 80 or 8080)
