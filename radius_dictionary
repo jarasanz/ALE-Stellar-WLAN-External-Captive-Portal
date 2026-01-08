@@ -1,0 +1,25 @@
+# Minimal RADIUS dictionary for ALE Stellar lab (pyrad-compatible)
+
+ATTRIBUTE User-Name                     1    string
+ATTRIBUTE User-Password                 2    string
+ATTRIBUTE NAS-IP-Address                4    ipaddr
+ATTRIBUTE Framed-IP-Address             8    ipaddr
+ATTRIBUTE Filter-Id                     11   string
+ATTRIBUTE Reply-Message   		18   string
+ATTRIBUTE Session-Timeout               27   integer
+ATTRIBUTE Called-Station-Id             30   string
+ATTRIBUTE Calling-Station-Id            31   string
+ATTRIBUTE Message-Authenticator   	80   octets
+ATTRIBUTE Alcatel-Policy-List           100  string
+ATTRIBUTE Alcatel-Redirect-Url          101  string
+ATTRIBUTE Alcatel-Device-Name           152  string
+ATTRIBUTE Alcatel-Device-Location       153  string
+ATTRIBUTE Alcatel-AP-Group              154  string
+
+# Accounting
+ATTRIBUTE Acct-Status-Type     40   integer
+ATTRIBUTE Acct-Input-Octets    42   integer
+ATTRIBUTE Acct-Output-Octets   43   integer
+ATTRIBUTE Acct-Session-Id      44   string
+ATTRIBUTE Acct-Session-Time    46   integer
+

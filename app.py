@@ -1,0 +1,582 @@
+import json, time
+from urllib.parse import urlencode
+from flask import Flask, request, render_template_string, url_for
+from config import Settings
+from db import (
+    ensure_dir, init_db, normalize_mac_any, log_event, mac_to_portal_param, allow_and_cache,
+    list_allow_macs, list_cache, list_events, delete_allow_mac, delete_cache_mac, clear_cache, 
+    clear_events, expire_cache_now
+)
+
+s = Settings()
+ensure_dir(s.data_dir)
+init_db(s.db_path)
+
+app = Flask(__name__)
+
+FORM_PAGE = """
+<!doctype html><meta charset="utf-8">
+<title>ALE Stellar Lab Portal</title>
+<body style="font-family:system-ui;max-width:760px;margin:40px auto;">
+  <div style="display:flex;align-items:center;gap:14px;margin-bottom:18px;">
+    <img src="{{ url_for('static', filename='ale_logo.png') }}"
+         alt="ALE"
+         style="height:72px;max-height:20vw;width:auto;">
+
+    <h2 style="margin:0;">ALE Stellar External Captive Portal (Lab)</h2>
+  </div>
+
+  {% if errmsg %}
+    <p style="color:#b00020"><b>Error from AP:</b> {{ errmsg }}</p>
+  {% endif %}
+
+  <h3>Client / AP Information</h3>
+  <p><b>Client MAC (display):</b> {{ clientmac }}</p>
+  <p><b>Client IP:</b> {{ clientip }}</p>
+  <p><b>AP MAC:</b> {{ switchmac }}</p>
+  <p><b>AP IP:</b> {{ switchip }}</p>
+  <p><b>SSID:</b> {{ ssid }}</p>
+
+  <details style="margin-top:20px;">
+    <summary><b>Raw parameters received from AP</b></summary>
+    <pre style="background:#f6f8fa;padding:12px;overflow:auto;">
+clientmac = {{ raw.clientmac }}
+clientip  = {{ raw.clientip }}
+switchmac = {{ raw.switchmac }}
+switchip  = {{ raw.switchip }}
+ssid      = {{ raw.ssid }}
+url       = {{ raw.url }}
+errmsg    = {{ raw.errmsg }}
+    </pre>
+  </details>
+
+  <details style="margin-top:20px;">
+    <summary><b>POST parameters that will be sent to AP</b></summary>
+    <pre style="background:#f6f8fa;padding:12px;overflow:auto;">
+POST {{ ap_login_url }}
+user     = {{ post.user }}
+password = {{ post.password }}
+url      = {{ post.success_url }}
+onerror  = {{ post.onerror_url }}
+    </pre>
+  </details>
+
+  <hr>
+
+  <form method="post" action="/register">
+    {% for k,v in hidden.items() %}
+      <input type="hidden" name="{{ k }}" value="{{ v }}">
+    {% endfor %}
+
+    <h3>Variables to send in the POST (editable)</h3>
+
+    <label>Success URL
+        <input name="url_override" value="{{ post.success_url }}"
+               style="width:100%;max-width:680px;">
+    </label>
+    <br><br>
+
+    <label>On-error URL
+        <input name="onerror_override" value="{{ post.onerror_url }}"
+               style="width:100%;max-width:680px;">
+    </label>
+    
+    <p style="color:#666;font-size:13px;">
+        Tip: values above will be used for the AP POST when you click Accept.
+    </p>
+    
+    <br><br>
+
+    <label>Email (lab field)
+      <input name="email" required style="width:100%;max-width:420px;">
+    </label>
+    <button type="submit">Accept</button>
+  </form>
+
+  <p style="margin-top:24px;color:#666">
+    This page shows exactly what the AP sent and what will be sent back.
+  </p>
+</body>
+"""
+
+POST_TO_AP_PAGE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Connecting…</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body {
+      font-family: system-ui;
+      max-width: 720px;
+      margin: 40px auto;
+      text-align: center;
+      color: #222;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      margin-bottom: 28px;
+    }
+    .brand img {
+      height: 44px;
+      width: auto;
+    }
+    .hint {
+      color: #666;
+      font-size: 14px;
+      margin-top: 12px;
+    }
+    button {
+      margin-top: 24px;
+      padding: 10px 22px;
+      font-size: 16px;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="brand">
+    <img src="{{ url_for('static', filename='ale_logo.png') }}" alt="ALE">
+    <strong>ALE Stellar</strong>
+  </div>
+
+  <h2>Connecting you to the network…</h2>
+  <p class="hint">This should only take a moment.</p>
+
+  <form id="loginForm" method="post" action="{{ ap_login_url }}">
+    <!-- Required for vendor type "ale" -->
+    <input type="hidden" name="user" value="{{ user }}">
+    <input type="hidden" name="password" value="{{ password }}">
+    <input type="hidden" name="url" value="{{ success_url }}">
+    <input type="hidden" name="onerror" value="{{ onerror_url }}">
+
+    <noscript>
+      <p class="hint">JavaScript is disabled. Click below to continue.</p>
+      <button type="submit">Continue</button>
+    </noscript>
+  </form>
+
+  <script>
+    // Auto-submit immediately for captive portal flow
+    document.getElementById('loginForm').submit();
+  </script>
+</body>
+</html>
+"""
+
+ADMIN_PAGE = """
+<!doctype html><meta charset="utf-8">
+<title>ALE Lab Admin</title>
+<body style="font-family:system-ui;max-width:1100px;margin:40px auto;">
+  <style>
+    :root { --base-font: 14px; }
+
+    body { font-size: var(--base-font); }
+
+    .expired {
+      color: #b00020;
+      font-weight: 600;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    th, td {
+      border: 1px solid #333;
+      padding: 6px;
+      vertical-align: top;
+      font-size: var(--base-font);          /* enforce same size everywhere */
+    }
+    th { font-weight: 700; }
+
+    /* Make <code> consistent in size, just monospace */
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 1em;                        /* same size as surrounding text */
+    }
+
+    /* Detail column wrapping + readable formatting */
+    td.detail {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    td.detail code {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      display: block;
+
+      background: #f6f8fa;
+      padding: 6px;
+      border-radius: 4px;
+      font-size: 1em;                        /* IMPORTANT: match table font size */
+      line-height: 1.25;
+    }
+  </style>
+
+  <div style="display:flex;align-items:center;gap:18px;margin-bottom:22px;">
+    <img src="{{ url_for('static', filename='ale_logo.png') }}"
+         alt="ALE"
+         style="height:72px;max-height:20vw;width:auto;">
+    <div>
+      <h2 style="margin:0;">ALE Stellar Captive Portal – Admin</h2>
+      <p style="margin:4px 0 0;color:#666;">DB: {{ db_path }}</p>
+    </div>
+  </div>
+  <hr style="margin:16px 0 22px;">
+
+  <div style="display:flex;gap:12px;flex-wrap:wrap;margin:10px 0 18px;">
+    <form method="post" action="/admin/expire-cache{{ qs }}"><button type="submit">Expire cache now</button></form>
+    <form method="post" action="/admin/clear-cache{{ qs }}"><button type="submit">Clear cache</button></form>
+    <form method="post" action="/admin/clear-events{{ qs }}"><button type="submit">Clear events</button></form>
+  </div>
+
+  <h3>Allowlist ({{ allow|length }})</h3>
+  <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;width:100%;">
+    <tr><th>MAC</th><th>Added (unix)</th><th>Added (local)</th><th>Action</th></tr>
+    {% for r in allow %}
+      <tr>
+        <td><code>{{ r.mac }}</code></td>
+        <td>{{ r.added_ts }}</td>
+        <td class="ts" data-ts="{{ r.added_ts }}"></td>
+        <td>
+          <form method="post" action="/admin/delete-allow{{ qs }}" style="margin:0;">
+            <input type="hidden" name="mac" value="{{ r.mac }}">
+            <button type="submit">Remove</button>
+          </form>
+        </td>
+      </tr>
+
+    {% endfor %}
+  </table>
+
+  <h3 style="margin-top:26px;">Cache ({{ cache|length }})</h3>
+  <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;width:100%;">
+    <tr><th>MAC</th><th>Expires (unix)</th><th>Expires (local)</th><th>Action</th></tr>
+    {% for r in cache %}
+      <tr>
+        <td><code>{{ r.mac }}</code></td>
+        <td>{{ r.expires_ts }}</td>
+        <td class="ts {% if r.expires_ts and r.expires_ts < now_ts %}expired{% endif %}"
+            data-ts="{{ r.expires_ts }}"></td>
+        <td>
+          <form method="post" action="/admin/delete-cache{{ qs }}" style="margin:0;">
+            <input type="hidden" name="mac" value="{{ r.mac }}">
+            <button type="submit">Remove</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+  </table>
+
+  <h3 style="margin-top:26px;">Recent Events ({{ events|length }})</h3>
+  <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;width:100%;">
+    <tr><th>ts (unix)</th><th>ts (local)</th><th>source</th><th>type</th><th>mac</th><th>ip</th><th class="detail">detail</th></tr>
+    {% for e in events %}
+      <tr>
+        <td>{{ e.ts }}</td>
+        <td class="ts" data-ts="{{ e.ts }}"></td>
+        <td>{{ e.source }}</td>
+        <td><code>{{ e.type }}</code></td>
+        <td><code>{{ e.mac }}</code></td>
+        <td><code>{{ e.ip }}</code></td>
+        <td class="detail"><code>{{ e.detail }}</code></td>
+      </tr>
+    {% endfor %}
+  </table>
+
+  <p style="margin-top:18px;color:#666">
+    Tip: bookmark <code>/admin{{ qs }}</code>
+  </p>
+  
+  <script>
+    (function () {
+      const fmt = new Intl.DateTimeFormat(undefined, {
+        year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", second: "2-digit",
+        hour12: false
+      });
+
+      document.querySelectorAll(".ts[data-ts]").forEach(el => {
+        const ts = Number(el.getAttribute("data-ts"));
+        if (!ts || Number.isNaN(ts)) {
+          el.textContent = "";
+          return;
+        }
+        const d = new Date(ts * 1000);
+        el.textContent = fmt.format(d);
+        el.title = d.toISOString(); // hover shows ISO UTC
+      });
+    })();
+  </script>
+  
+</body>
+"""
+
+
+def log_jsonl(path: str, rec: dict) -> None:
+    rec = {**rec, "ts": int(time.time()), "ua": request.headers.get("User-Agent", "")}
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
+
+def get_params():
+    # As per memo: clientmac, clientip, switchmac, swicthip (typo in memo), ssid, url, errmsg
+    # We'll accept both "swicthip" and "switchip" for sanity.
+    q = request.args
+    clientmac = q.get("clientmac", "")
+    clientip = q.get("clientip", "")
+    switchmac = q.get("switchmac", "")
+    switchip = q.get("swicthip", "") or q.get("switchip", "")
+    ssid = q.get("ssid", "")
+    url = q.get("url", "")
+    errmsg = q.get("errmsg", "")
+    return clientmac, clientip, switchmac, switchip, ssid, url, errmsg
+
+def admin_ok() -> bool:
+    token = getattr(s, "admin_token", "")
+    if not token:
+        return True  # lab mode: open
+    return request.args.get("token", "") == token
+
+@app.get("/login/ale")
+def login_ale():
+    clientmac, clientip, switchmac, switchip, ssid, url, errmsg = get_params()
+    clientmac_raw = clientmac
+    
+    mac12 = normalize_mac_any(clientmac)
+    log_event(s.db_path, "portal", "hit", mac=mac12, ip=clientip, detail=request.query_string.decode(errors="ignore"))
+    log_jsonl(s.portal_log_jsonl, {
+        "event": "hit",
+        "clientmac_raw": clientmac,
+        "clientmac_norm": mac12,
+        "clientip": clientip,
+        "switchmac": switchmac,
+        "switchip": switchip,
+        "ssid": ssid,
+        "url": url,
+        "errmsg": errmsg,
+    })
+
+    # Display MAC in the same "lowercase colon" style mentioned as default in memo
+    clientmac_display = mac_to_portal_param(mac12) if mac12 else clientmac
+
+    # Build derived POST preview values (no side effects)
+    user = mac12
+    password = mac12
+
+    portal_base = request.host_url.rstrip("/")
+    onerror_url = portal_base + "/login/ale?" + urlencode({
+        "clientmac": clientmac_raw,
+        "clientip": clientip,
+        "switchmac": switchmac,
+        "switchip": switchip,
+        "ssid": ssid,
+        "url": url,
+        "errmsg": "Authentication failure",
+    })
+
+    return render_template_string(
+        FORM_PAGE,
+        url_for=url_for,
+        clientmac=clientmac_display,
+        clientip=clientip,
+        switchmac=switchmac,
+        switchip=switchip,
+        ssid=ssid,
+        errmsg=errmsg,
+
+        raw={
+            "clientmac": clientmac_raw,
+            "clientip": clientip,
+            "switchmac": switchmac,
+            "switchip": switchip,
+            "ssid": ssid,
+            "url": url,
+            "errmsg": errmsg,
+        },
+
+        post={
+            "user": user,
+            "password": password,
+            "success_url": url or "http://example.com/",
+            "onerror_url": onerror_url,
+        },
+
+        hidden={
+            "clientmac": clientmac_raw,
+            "clientip": clientip,
+            "switchmac": switchmac,
+            "switchip": switchip,
+            "ssid": ssid,
+            "url": url,
+        },
+
+        ap_login_url=s.ap_login_url,
+    )
+
+@app.post("/register")
+def register():
+    clientmac = request.form.get("clientmac", "")
+    clientip = request.form.get("clientip", "")
+    switchmac = request.form.get("switchmac", "")
+    switchip  = request.form.get("switchip", "")
+    ssid = request.form.get("ssid", "")
+    url = request.form.get("url", "")  # original URL from AP (hidden)
+
+    url_override = (request.form.get("url_override", "") or "").strip()
+    onerror_override = (request.form.get("onerror_override", "") or "").strip()
+    email = (request.form.get("email", "") or "").strip()
+
+    mac12 = normalize_mac_any(clientmac)
+    if not mac12:
+        return "Missing/invalid clientmac (AP didn’t send one we can parse).", 400
+
+    # Compute effective URLs BEFORE logging them
+    success_url = url_override or url or "http://example.com/"
+
+    portal_base = request.host_url.rstrip("/")
+    computed_onerror_url = portal_base + "/login/ale?" + urlencode({
+        "clientmac": clientmac,
+        "clientip": clientip,
+        "switchmac": switchmac,
+        "switchip": switchip,
+        "ssid": ssid,
+        "url": success_url,
+        "errmsg": "Authentication failure",
+    })
+    onerror_url = onerror_override or computed_onerror_url
+
+    # Now logging is safe
+    log_event(
+        s.db_path, "portal", "register", mac=mac12, ip=clientip,
+        detail={"ssid": ssid, "email": email, "success_url": success_url, "onerror_url": onerror_url}
+    )
+    log_jsonl(s.portal_log_jsonl, {
+        "event": "register",
+        "clientmac_raw": clientmac,
+        "clientmac_norm": mac12,
+        "clientip": clientip,
+        "ssid": ssid,
+        "email": email,
+        "url_original": url,
+        "url_override": url_override,
+        "success_url": success_url,
+        "onerror_override": onerror_override,
+        "onerror_url": onerror_url,
+        "switchmac": switchmac,
+        "switchip": switchip,
+    })
+
+    # Enroll + cache after successful parse
+    allow_and_cache(s.db_path, mac12, getattr(s, "cache_ttl_seconds", 6*3600))
+
+    # Portal-auth credentials (lab)
+    user = mac12
+    password = mac12
+
+    return render_template_string(
+        POST_TO_AP_PAGE,
+        ap_login_url=s.ap_login_url,
+        user=user,
+        password=password,
+        success_url=success_url,
+        onerror_url=onerror_url
+    )
+
+
+@app.get("/admin")
+def admin():
+    if not admin_ok():
+        return "Forbidden", 403
+
+    allow = list_allow_macs(s.db_path, limit=500)
+    cache = list_cache(s.db_path, limit=500)
+    events = list_events(s.db_path, limit=200)
+
+    # preserve token in action URLs
+    token = request.args.get("token", "")
+    qs = f"?token={token}" if token else ""
+
+    # Pretty-print JSON details for admin UI readability
+    for e in events:
+        if not e.get("detail"):
+            continue
+        try:
+            parsed = json.loads(e["detail"])
+            e["detail"] = json.dumps(parsed, indent=2, ensure_ascii=False)
+        except Exception:
+            # Not JSON → leave as-is
+            pass
+
+    return render_template_string(
+        ADMIN_PAGE,
+        db_path=s.db_path,
+        allow=allow,
+        cache=cache,
+        events=events,
+        qs=qs,
+        now_ts=int(time.time()),
+    )
+
+@app.post("/admin/delete-allow")
+def admin_delete_allow():
+    if not admin_ok():
+        return "Forbidden", 403
+    mac = request.form.get("mac", "")
+    delete_allow_mac(s.db_path, mac)
+    # also drop from cache so it really re-portals
+    delete_cache_mac(s.db_path, mac)
+    log_event(s.db_path, "admin", "delete_allow", mac=normalize_mac_any(mac), detail={"mac": mac})
+    token = request.args.get("token", "")
+    return ("" , 302, {"Location": "/admin" + (f"?token={token}" if token else "")})
+
+@app.post("/admin/delete-cache")
+def admin_delete_cache():
+    if not admin_ok():
+        return "Forbidden", 403
+    mac = request.form.get("mac", "")
+    delete_cache_mac(s.db_path, mac)
+    log_event(s.db_path, "admin", "delete_cache", mac=normalize_mac_any(mac), detail={"mac": mac})
+    token = request.args.get("token", "")
+    return ("" , 302, {"Location": "/admin" + (f"?token={token}" if token else "")})
+
+@app.post("/admin/clear-cache")
+def admin_clear_cache():
+    if not admin_ok():
+        return "Forbidden", 403
+    clear_cache(s.db_path)
+    log_event(s.db_path, "admin", "clear_cache")
+    token = request.args.get("token", "")
+    return ("" , 302, {"Location": "/admin" + (f"?token={token}" if token else "")})
+
+@app.post("/admin/clear-events")
+def admin_clear_events():
+    if not admin_ok():
+        return "Forbidden", 403
+    clear_events(s.db_path)
+    log_event(s.db_path, "admin", "clear_events")
+    token = request.args.get("token", "")
+    return ("" , 302, {"Location": "/admin" + (f"?token={token}" if token else "")})
+
+@app.post("/admin/expire-cache")
+def admin_expire_cache():
+    if not admin_ok():
+        return "Forbidden", 403
+    expire_cache_now(s.db_path)
+    log_event(s.db_path, "admin", "expire_cache_now")
+    token = request.args.get("token", "")
+    return ("", 302, {"Location": "/admin" + (f"?token={token}" if token else "")})
+
+if __name__ == "__main__":
+    app.run(
+        host=s.portal_host,
+        port=s.portal_port,
+        debug=False
+    )
+
