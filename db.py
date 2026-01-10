@@ -37,6 +37,37 @@ def init_db(db_path: str) -> None:
         detail TEXT
       )
     """)
+    conn.execute("""
+      CREATE TABLE IF NOT EXISTS admin_settings (
+        k TEXT PRIMARY KEY,
+        v TEXT
+      )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mac_roles (
+            mac TEXT PRIMARY KEY,
+            arp TEXT,
+            updated_ts INTEGER
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+def get_setting(db_path: str, key: str, default: str = "") -> str:
+    conn = connect(db_path)
+    row = conn.execute("SELECT v FROM admin_settings WHERE k=?", (key,)).fetchone()
+    conn.close()
+    return (row[0] if row and row[0] is not None else default)
+
+
+def set_setting(db_path: str, key: str, value: str) -> None:
+    conn = connect(db_path)
+    conn.execute(
+        "INSERT INTO admin_settings(k,v) VALUES(?,?) "
+        "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+        (key, value),
+    )
     conn.commit()
     conn.close()
 
@@ -256,3 +287,27 @@ def expire_cache_now(db_path: str) -> None:
     conn.execute("UPDATE mac_cache SET expires_ts = ?", (now_ts() - 1,))
     conn.commit()
     conn.close()
+    
+def get_mac_role(db_path: str, mac12: str) -> str:
+    mac12 = normalize_mac_any(mac12)
+    if not mac12:
+        return ""
+    conn = connect(db_path)
+    row = conn.execute("SELECT arp FROM mac_roles WHERE mac=?", (mac12,)).fetchone()
+    conn.close()
+    return (row[0] or "") if row else ""
+
+def set_mac_role(db_path: str, mac12: str, arp: str) -> None:
+    mac12 = normalize_mac_any(mac12)
+    arp = (arp or "").strip()
+    if not mac12:
+        return
+    conn = connect(db_path)
+    conn.execute(
+        "INSERT INTO mac_roles(mac, arp, updated_ts) VALUES(?,?,?) "
+        "ON CONFLICT(mac) DO UPDATE SET arp=excluded.arp, updated_ts=excluded.updated_ts",
+        (mac12, arp, now_ts())
+    )
+    conn.commit()
+    conn.close()
+

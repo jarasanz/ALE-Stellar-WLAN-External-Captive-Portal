@@ -10,11 +10,19 @@ ATTRIBUTE Session-Timeout               27   integer
 ATTRIBUTE Called-Station-Id             30   string
 ATTRIBUTE Calling-Station-Id            31   string
 ATTRIBUTE Message-Authenticator   	80   octets
-ATTRIBUTE Alcatel-Policy-List           100  string
-ATTRIBUTE Alcatel-Redirect-Url          101  string
-ATTRIBUTE Alcatel-Device-Name           152  string
-ATTRIBUTE Alcatel-Device-Location       153  string
-ATTRIBUTE Alcatel-AP-Group              154  string
+
+# Vendor-specific (ALE / Alcatel-Lucent Enterprise)
+VENDOR          Alcatel-Lucent          800
+
+BEGIN-VENDOR    Alcatel-Lucent
+ATTRIBUTE 	Alcatel-Policy-List     100  	string
+ATTRIBUTE       Alcatel-Redirection-URL 101     string
+ATTRIBUTE       Alcatel-Redirect-URL    101     string
+ATTRIBUTE 	Alcatel-Redirect-Url    101  	string
+ATTRIBUTE 	Alcatel-Device-Name     152  	string
+ATTRIBUTE 	Alcatel-Device-Location 153  	string
+ATTRIBUTE 	Alcatel-AP-Group        154  	string
+END-VENDOR      Alcatel-Lucent
 
 # Accounting
 ATTRIBUTE Acct-Status-Type     40   integer

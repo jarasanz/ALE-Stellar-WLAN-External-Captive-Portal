@@ -5,7 +5,7 @@ from config import Settings
 from db import (
     ensure_dir, init_db, normalize_mac_any, log_event, mac_to_portal_param, allow_and_cache,
     list_allow_macs, list_cache, list_events, delete_allow_mac, delete_cache_mac, clear_cache, 
-    clear_events, expire_cache_now
+    clear_events, expire_cache_now, get_setting, set_setting,
 )
 
 s = Settings()
@@ -84,6 +84,17 @@ onerror  = {{ post.onerror_url }}
     <p style="color:#666;font-size:13px;">
         Tip: values above will be used for the AP POST when you click Accept.
     </p>
+    
+    <br><br>
+
+    <label>ARP / Role (optional, sent as Filter-Id after registration)
+      <input name="arp" value="" placeholder="{{ s.role_final }}"
+             style="width:100%;max-width:240px;">
+    </label>
+    <small style="color:#666;display:block;margin-top:6px;">
+      Leave empty to use the default role or not sending any role if default role equals "" (config.py). Fill to store a per-MAC role.
+    </small>
+
     
     <br><br>
 
@@ -231,6 +242,50 @@ ADMIN_PAGE = """
   </div>
   <hr style="margin:16px 0 22px;">
 
+  <h3 style="margin-top:22px;">Unknown MAC policy (MAB)</h3>
+
+  <form method="post" action="/admin/save-unknown-policy{{ qs }}"
+        style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end;margin:10px 0 18px;">
+
+    <div style="display:flex;gap:20px;flex-wrap:wrap;align-items:flex-start;margin-bottom:12px;">
+      <label style="display:flex;flex-direction:column;gap:6px;min-width:240px;flex:1 1 0;">
+        Decision for unknown MACs
+         <select name="unknown_policy">
+          <option value="reject">Access-Reject</option>
+          <option value="redirect">Access-Accept + Redirect</option>
+        </select>
+      </label>
+
+      <label style="display:flex;flex-direction:column;gap:6px;min-width:240px;flex:1;">
+        ARP for unknown users (Filter-Id)
+        <input name="unknown_arp" value="{{ unknown_arp }}">
+        <small style="color:#666;">Effective value used in RADIUS replies.</small>
+      </label>
+    </div>
+
+
+    <label style="display:flex;flex-direction:column;gap:6px;min-width:min(520px,100%);flex:1;">
+      Portal base URL (used in Alcatel-Redirect-URL)
+      <input name="portal_base" value="{{ portal_base }}">
+      <small style="color:#666;">
+        Public URL reachable by clients/APs.
+        {% if portal_base != s.portal_public_base_url %}
+          <br>Config default: <code>{{ s.portal_public_base_url or "(not set)" }}</code>
+        {% else %}
+          <br>Using config default.
+        {% endif %}
+      </small>
+    </label>
+
+
+    <button type="submit">Save</button>
+  </form>
+
+  <p style="margin:0 0 10px;color:#666;">
+    Notes: In “redirect” mode, unknown MACs are accepted with <code>Filter-Id=&lt;ARP&gt;</code> and
+    <code>Alcatel-Redirect-URL=&lt;portal&gt;</code>.
+  </p>
+
   <div style="display:flex;gap:12px;flex-wrap:wrap;margin:10px 0 18px;">
     <form method="post" action="/admin/expire-cache{{ qs }}"><button type="submit">Expire cache now</button></form>
     <form method="post" action="/admin/clear-cache{{ qs }}"><button type="submit">Clear cache</button></form>
@@ -319,6 +374,17 @@ ADMIN_PAGE = """
 </body>
 """
 
+def prettify_errmsg(msg: str) -> str:
+    msg = (msg or "").strip()
+    if not msg:
+        return ""
+    # Insert a separator between "...failureService..." → "...failure | Service..."
+    msg = re.sub(r"(?i)(failure)(service)", r"\1 | \2", msg)
+    # Also: add separator between a lowercase followed by uppercase (word boundary in concatenated strings)
+    msg = re.sub(r"([a-z])([A-Z])", r"\1 | \2", msg)
+    # Compress multiple spaces
+    msg = re.sub(r"\s+", " ", msg).strip()
+    return msg
 
 def log_jsonl(path: str, rec: dict) -> None:
     rec = {**rec, "ts": int(time.time()), "ua": request.headers.get("User-Agent", "")}
@@ -335,7 +401,7 @@ def get_params():
     switchip = q.get("swicthip", "") or q.get("switchip", "")
     ssid = q.get("ssid", "")
     url = q.get("url", "")
-    errmsg = q.get("errmsg", "")
+    errmsg = prettify_errmsg(q.get("errmsg", ""))
     return clientmac, clientip, switchmac, switchip, ssid, url, errmsg
 
 def admin_ok() -> bool:
@@ -381,8 +447,13 @@ def login_ale():
         "errmsg": "Authentication failure",
     })
 
+    print("FULL_URL:", request.url, flush=True)
+    print("ARGS:", dict(request.args.lists()), flush=True)
+    print("ERRMSG_LIST:", request.args.getlist("errmsg"), flush=True)
+    
     return render_template_string(
         FORM_PAGE,
+        s=s,
         url_for=url_for,
         clientmac=clientmac_display,
         clientip=clientip,
@@ -433,6 +504,10 @@ def register():
     onerror_override = (request.form.get("onerror_override", "") or "").strip()
     email = (request.form.get("email", "") or "").strip()
 
+    arp = (request.form.get("arp", "") or "").strip()
+    if arp and not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", arp):
+        return "Invalid ARP format.", 400
+    
     mac12 = normalize_mac_any(clientmac)
     if not mac12:
         return "Missing/invalid clientmac (AP didn’t send one we can parse).", 400
@@ -471,6 +546,7 @@ def register():
         "onerror_url": onerror_url,
         "switchmac": switchmac,
         "switchip": switchip,
+        "arp": arp,
     })
 
     # Enroll + cache after successful parse
@@ -498,6 +574,10 @@ def admin():
     allow = list_allow_macs(s.db_path, limit=500)
     cache = list_cache(s.db_path, limit=500)
     events = list_events(s.db_path, limit=200)
+    unknown_policy = get_setting(s.db_path, "unknown_policy", s.unknown_mac_policy_default)
+    unknown_arp    = get_setting(s.db_path, "unknown_arp", s.unknown_mac_arp_default)
+    portal_base    = get_setting(s.db_path, "portal_base", s.portal_public_base_url)
+
 
     # preserve token in action URLs
     token = request.args.get("token", "")
@@ -516,12 +596,16 @@ def admin():
 
     return render_template_string(
         ADMIN_PAGE,
+        s=s,
         db_path=s.db_path,
         allow=allow,
         cache=cache,
         events=events,
         qs=qs,
         now_ts=int(time.time()),
+        unknown_policy=unknown_policy,
+        unknown_arp=unknown_arp,
+        portal_base=portal_base,
     )
 
 @app.post("/admin/delete-allow")
@@ -572,6 +656,25 @@ def admin_expire_cache():
     log_event(s.db_path, "admin", "expire_cache_now")
     token = request.args.get("token", "")
     return ("", 302, {"Location": "/admin" + (f"?token={token}" if token else "")})
+
+@app.post("/admin/save-unknown-policy")
+def admin_save_unknown_policy():
+    # if you have admin token enforcement, apply it here too (same as other admin POSTs)
+    policy = (request.form.get("unknown_policy", "") or "").strip().lower()
+    arp    = (request.form.get("unknown_arp", "") or "").strip()
+    pbase  = (request.form.get("portal_base", "") or "").strip().rstrip("/")
+
+    if policy not in ("reject", "redirect"):
+        policy = "redirect"
+
+    set_setting(s.db_path, "unknown_policy", policy)
+    set_setting(s.db_path, "unknown_arp", arp)
+    set_setting(s.db_path, "portal_base", pbase)
+
+    log_event(s.db_path, "portal", "admin_set_unknown_policy",
+              detail={"unknown_policy": policy, "unknown_arp": arp, "portal_base": pbase})
+
+    return ("", 303, {"Location": "/admin"})
 
 if __name__ == "__main__":
     app.run(

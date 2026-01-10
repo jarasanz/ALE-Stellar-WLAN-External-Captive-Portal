@@ -6,9 +6,11 @@ from pyrad.dictionary import Dictionary
 from config import Settings
 from db import (
     ensure_dir, init_db, normalize_mac_any,
-    allowed_decision, allow_and_cache, log_event
+    allowed_decision, allow_and_cache, log_event,
+    get_setting, get_mac_role,
 )
 import re
+import traceback
 
 MAC_PREFIX_COLON = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}")
 MAC_PREFIX_DASH  = re.compile(r"^([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}")
@@ -93,15 +95,35 @@ def parse_called_station_id(called: str) -> tuple[str, str]:
     ssid = rest
     return ap_mac12, ssid
 
+def _pick_arp_for_mac(db_path: str, mac12: str, default_role: str) -> str:
+    arp = (get_mac_role(db_path, mac12) or default_role or "").strip()
+    if arp and not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", arp):
+        return ""
+    return arp
+
 class ALEStellarRadius(Server):
-    def send_accept(self, pkt, mac12: str, fid: str = ""):
+    def send_accept(self, pkt, mac12: str, filter_id: str = "", redirect_url: str = ""):
         reply = self.CreateReplyPacket(pkt)
         reply.code = AccessAccept
         reply["User-Name"] = mac12
         reply["Session-Timeout"] = s.session_timeout_seconds
         reply["Reply-Message"] = "OK"
-        if fid:
-            reply["Filter-Id"] = fid
+        if filter_id:
+            reply["Filter-Id"] = filter_id
+        
+        # Redirect attribute (only for unknown redirect mode)
+        # If present, push redirect URL attribute (naming varies in docs)
+        if redirect_url:
+            # whichever attribute name exists in your dictionary
+            try:
+                reply["Alcatel-Redirect-URL"] = redirect_url
+            except Exception:
+                pass
+            try:
+                reply["Alcatel-Redirection-URL"] = redirect_url
+            except Exception:
+                pass    
+            
         tpg = str(pkt.get("Tunnel-Private-Group-ID", [""])[0] or "")
         if tpg:
             reply["Tunnel-Private-Group-ID"] = tpg
@@ -179,15 +201,19 @@ class ALEStellarRadius(Server):
             return
 
         if is_mac_auth(pkt):
-            # MAC Authentication phase (optional in memo, but you want it enabled)
+            # MAC Authentication phase (optional, but we want it enabled)
             if allowed:
+                arp = _pick_arp_for_mac(s.db_path, mac12, s.role_final)
                 log_event(
                     s.db_path, 
                     "radius", 
                     "mab_accept", 
                     mac=mac12, 
                     ip=framed_ip,
-                    detail=detail_base
+                    detail={
+                        **detail_base,
+                        "ARP": arp,
+                    }
                 )
                 log_jsonl(
                     s.radius_log_jsonl,
@@ -200,57 +226,97 @@ class ALEStellarRadius(Server):
                         "called":called, 
                         "ap_mac":ap_mac12, 
                         "ssid":ssid, 
-                        **nas
+                        **nas,
+                        "ARP": arp,
                     },
                 )
 
-                self.send_accept(pkt, mac12, fid)
+                self.send_accept(pkt, mac12, filter_id=arp)
+                return
             else:
-                log_event(
-                    s.db_path, 
-                    "radius", 
-                    "mab_reject", 
-                    mac=mac12, 
-                    ip=framed_ip, 
-                    detail=detail_base
-                )
-                log_jsonl(
-                    s.radius_log_jsonl, 
-                    {
-                        "event":"mab_reject",
+                # Unknown MAC during MAB
+                unknown_policy = get_setting(s.db_path, "unknown_policy", s.unknown_mac_policy_default)
+                unknown_arp    = get_setting(s.db_path, "unknown_arp", s.unknown_mac_arp_default).strip()
+                portal_base    = get_setting(s.db_path, "portal_base", s.portal_public_base_url).strip().rstrip("/")
+
+                if unknown_policy == "redirect" and portal_base:
+                    # Build redirect URL to your portal. Keep it simple first: just client MAC + called station id.
+                    # You can enrich later with NAS fields if needed.
+                    redir = portal_base + "/login/ale?" + urlencode({
+                        "clientmac": mac_to_portal_param(mac12) or mac12,
+                        "ssid": ssid,
+                        "switchip": nas.get("nas_ip", ""),
+                        "switchmac": ap_mac12,
+                        "url": "http://example.com/",
+                    })
+
+                    log_event(
+                        s.db_path, "radius", "mab_unknown_redirect",
+                        mac=mac12, ip=framed_ip,
+                        detail={**detail_base, "unknown_policy": unknown_policy, "unknown_arp": unknown_arp, "redirect": redir}
+                    )
+                    log_jsonl(s.radius_log_jsonl, {
+                        "event": "mab_unknown_redirect",
                         "decision": decision,
-                        "mac":mac12,
-                        "ip":framed_ip,
+                        "mac": mac12,
+                        "ip": framed_ip,
                         "src_ip": src_ip,
-                        "called":called, 
-                        "ap_mac":ap_mac12, 
-                        "ssid":ssid, 
-                        **nas
-                    },
+                        "called": called,
+                        "ap_mac": ap_mac12,
+                        "ssid": ssid,
+                        **nas,
+                        "unknown_arp": unknown_arp,
+                        "redirect": redir,
+                    })
+
+                    # Accept with pre-auth ARP + redirect URL
+                    self.send_accept(pkt, mac12, unknown_arp, redir)
+                    return
+
+                # Default: reject
+                log_event(
+                    s.db_path, "radius", "mab_reject",
+                    mac=mac12, ip=framed_ip, detail=detail_base
                 )
+                log_jsonl(s.radius_log_jsonl, {
+                    "event": "mab_reject",
+                    "decision": decision,
+                    "mac": mac12,
+                    "ip": framed_ip,
+                    "src_ip": src_ip,
+                    "called": called,
+                    "ap_mac": ap_mac12,
+                    "ssid": ssid,
+                    **nas
+                })
 
                 reply = self.CreateReplyPacket(pkt)
                 reply.code = AccessReject
                 reply.add_message_authenticator()
                 self.SendReplyPacket(pkt.fd, reply)
-            return
+                return
 
         # Portal authentication phase:
         # Portal already enrolled MAC in DB. If MAC is allowed, accept.
         if allowed:
             kind = "mab_accept" if is_mac_auth(pkt) else "portal_accept"
+            arp = _pick_arp_for_mac(s.db_path, mac12, s.role_final)
+            
             log_event(
                 s.db_path,
                 "radius",
-                "portal_accept",
+                kind,
                 mac=mac12,
                 ip=framed_ip,
-                detail=detail_base
+                detail={
+                    **detail_base,
+                    "ARP": arp,
+                }
             )
             log_jsonl(
                 s.radius_log_jsonl,
                 {
-                    "event": "portal_accept",
+                    "event": kind,
                     "decision": decision,
                     "mac": mac12,
                     "ip": framed_ip,
@@ -260,10 +326,11 @@ class ALEStellarRadius(Server):
                     "ap_mac":ap_mac12,
                     "ssid":ssid, 
                     **nas,
+                    "ARP": arp,
                 },
             )
 
-            self.send_accept(pkt, mac12, fid)
+            self.send_accept(pkt, mac12, filter_id=arp)
             return
 
         # Otherwise reject
@@ -391,4 +458,4 @@ if __name__ == "__main__":
                     srv.HandleAcctPacket(pkt)
             except Exception as e:
                 print(f"Error handling packet from {addr}: {e}", flush=True)
-
+                traceback.print_exc()
