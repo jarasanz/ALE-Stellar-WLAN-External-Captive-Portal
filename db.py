@@ -50,6 +50,38 @@ def init_db(db_path: str) -> None:
             updated_ts INTEGER
         )
     """)
+    conn.execute("""
+      CREATE TABLE IF NOT EXISTS mac_roles (
+        mac TEXT PRIMARY KEY,
+        arp TEXT,
+        updated_ts INTEGER
+      )
+    """)
+    conn.execute("""
+      CREATE TABLE IF NOT EXISTS sessions (
+        session_key TEXT PRIMARY KEY,      -- stable key for updates (acct_session_id preferred)
+        acct_session_id TEXT,
+        acct_multi_session_id TEXT,
+
+        mac TEXT,
+        calling_station_id TEXT,
+        nas_ip TEXT,
+        nas_id TEXT,
+        src_ip TEXT,
+
+        framed_ip TEXT,
+        ap_mac TEXT,
+        ssid TEXT,
+
+        status TEXT,                        -- start | interim | stop
+        start_ts INTEGER,
+        last_seen_ts INTEGER,
+        stop_ts INTEGER,
+
+        raw_json TEXT
+      )
+    """)
+
 
     conn.commit()
     conn.close()
@@ -310,4 +342,200 @@ def set_mac_role(db_path: str, mac12: str, arp: str) -> None:
     )
     conn.commit()
     conn.close()
+
+def get_mac_role(db_path: str, mac12: str) -> str:
+    mac12 = normalize_mac_any(mac12)
+    if not mac12:
+        return ""
+    conn = connect(db_path)
+    row = conn.execute("SELECT arp FROM mac_roles WHERE mac=?", (mac12,)).fetchone()
+    conn.close()
+    return (row[0] or "") if row else ""
+
+
+def set_mac_role(db_path: str, mac12: str, arp: str) -> None:
+    mac12 = normalize_mac_any(mac12)
+    arp = (arp or "").strip()
+    if not mac12:
+        return
+    conn = connect(db_path)
+    conn.execute(
+        "INSERT INTO mac_roles(mac, arp, updated_ts) VALUES(?,?,?) "
+        "ON CONFLICT(mac) DO UPDATE SET arp=excluded.arp, updated_ts=excluded.updated_ts",
+        (mac12, arp, now_ts()),
+    )
+    conn.commit()
+    conn.close()
+
+def list_mac_roles(db_path: str, limit: int = 500):
+    conn = connect(db_path)
+    rows = conn.execute(
+        "SELECT mac, arp, updated_ts FROM mac_roles ORDER BY updated_ts DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return [{"mac": r[0], "arp": r[1], "updated_ts": r[2]} for r in rows]
+
+
+def delete_mac_role(db_path: str, mac12: str) -> None:
+    mac12 = normalize_mac_any(mac12)
+    if not mac12:
+        return
+    conn = connect(db_path)
+    conn.execute("DELETE FROM mac_roles WHERE mac=?", (mac12,))
+    conn.commit()
+    conn.close()
+
+def upsert_session(
+    db_path: str,
+    session_key: str,
+    acct_session_id: str = "",
+    acct_multi_session_id: str = "",
+    mac: str = "",
+    calling_station_id: str = "",
+    nas_ip: str = "",
+    nas_id: str = "",
+    src_ip: str = "",
+    framed_ip: str = "",
+    ap_mac: str = "",
+    ssid: str = "",
+    status: str = "",
+    start_ts: int | None = None,
+    stop_ts: int | None = None,
+    raw: dict | None = None,
+) -> None:
+    session_key = (session_key or "").strip()
+    if not session_key:
+        return
+
+    mac12 = normalize_mac_any(mac) or ""
+    calling_norm = normalize_mac_any(calling_station_id) or calling_station_id
+    now = now_ts()
+    raw_json = json.dumps(raw or {}, ensure_ascii=False)
+
+    conn = connect(db_path)
+    conn.execute(
+        """
+        INSERT INTO sessions(
+          session_key, acct_session_id, acct_multi_session_id,
+          mac, calling_station_id, nas_ip, nas_id, src_ip,
+          framed_ip, ap_mac, ssid,
+          status, start_ts, last_seen_ts, stop_ts, raw_json
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(session_key) DO UPDATE SET
+          acct_session_id=excluded.acct_session_id,
+          acct_multi_session_id=excluded.acct_multi_session_id,
+          mac=excluded.mac,
+          calling_station_id=excluded.calling_station_id,
+          nas_ip=excluded.nas_ip,
+          nas_id=excluded.nas_id,
+          src_ip=excluded.src_ip,
+          framed_ip=excluded.framed_ip,
+          ap_mac=excluded.ap_mac,
+          ssid=excluded.ssid,
+          status=excluded.status,
+          start_ts=COALESCE(sessions.start_ts, excluded.start_ts),
+          last_seen_ts=excluded.last_seen_ts,
+          stop_ts=COALESCE(excluded.stop_ts, sessions.stop_ts),
+          raw_json=excluded.raw_json
+        """,
+        (
+            session_key,
+            acct_session_id,
+            acct_multi_session_id,
+            mac12,
+            calling_norm,
+            nas_ip,
+            nas_id,
+            src_ip,
+            framed_ip,
+            ap_mac,
+            ssid,
+            status,
+            start_ts,
+            now,
+            stop_ts,
+            raw_json,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+def list_sessions(db_path: str, limit: int = 50):
+    conn = connect(db_path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT session_key, acct_session_id, acct_multi_session_id,
+               mac, calling_station_id, nas_ip, nas_id, src_ip,
+               framed_ip, ap_mac, ssid,
+               status, start_ts, last_seen_ts, stop_ts
+        FROM sessions
+        ORDER BY last_seen_ts DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+def clear_sessions(db_path: str) -> None:
+    conn = connect(db_path)
+    conn.execute("DELETE FROM sessions")
+    conn.commit()
+    conn.close()
+
+
+def prune_sessions(db_path: str, max_age_seconds: int = 24*3600) -> None:
+    cutoff = now_ts() - max_age_seconds
+    conn = connect(db_path)
+    conn.execute(
+        "DELETE FROM sessions WHERE last_seen_ts < ?",
+        (cutoff,)
+    )
+    conn.commit()
+    conn.close()
+
+def get_session(db_path: str, session_key: str):
+    conn = connect(db_path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        """
+        SELECT session_key, acct_session_id, acct_multi_session_id,
+               mac, calling_station_id, nas_ip, nas_id, src_ip,
+               framed_ip, ap_mac, ssid,
+               status, start_ts, last_seen_ts, stop_ts
+        FROM sessions
+        WHERE session_key = ?
+        """,
+        (session_key,),
+    ).fetchone()
+    conn.close()
+    return row
+
+def delete_session(db_path: str, session_key: str) -> None:
+    session_key = (session_key or "").strip()
+    if not session_key:
+        return
+    conn = connect(db_path)
+    conn.execute("DELETE FROM sessions WHERE session_key = ?", (session_key,))
+    conn.commit()
+    conn.close()
+
+def clear_stop_sessions(db_path: str) -> int:
+    """
+    Delete sessions that are in 'stop' status (and optionally those with stop_ts set).
+    Returns number of rows deleted.
+    """
+    import sqlite3
+    with sqlite3.connect(db_path) as con:
+        cur = con.cursor()
+        cur.execute("""
+            DELETE FROM sessions
+            WHERE status = 'stop'
+               OR (stop_ts IS NOT NULL AND stop_ts > 0)
+        """)
+        con.commit()
+        return cur.rowcount
 

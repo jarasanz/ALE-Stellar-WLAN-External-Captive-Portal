@@ -17,6 +17,12 @@ class Settings:
     radius_auth_port: int = 1812
     radius_acct_port: int = 1813
     radius_secret: bytes = b"sharedsecret"  # MUST match Stellar SSID config
+    radius_dictionary_path: str = "radius_dictionary"
+    
+    # CoA / Disconnect
+    coa_port: int = 3799
+    coa_secret: str = "sharedsecret"   # often same as RADIUS; adjust if your AP uses a different one
+    coa_timeout_seconds: int = 2
 
     # Defaults for unknown MAC handling
     unknown_mac_policy_default: str = "reject"  # "reject" or "redirect"

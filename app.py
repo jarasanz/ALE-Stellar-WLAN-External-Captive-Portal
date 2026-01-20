@@ -1,16 +1,30 @@
 import json, time
-from urllib.parse import urlencode
-from flask import Flask, request, render_template_string, url_for
+from urllib.parse import urlencode, quote
+from flask import Flask, request, render_template_string, url_for, abort, request
 from config import Settings
 from db import (
     ensure_dir, init_db, normalize_mac_any, log_event, mac_to_portal_param, allow_and_cache,
     list_allow_macs, list_cache, list_events, delete_allow_mac, delete_cache_mac, clear_cache, 
-    clear_events, expire_cache_now, get_setting, set_setting,
+    clear_events, expire_cache_now, get_setting, set_setting, set_mac_role,
+    list_mac_roles, delete_mac_role, list_sessions, clear_sessions, prune_sessions,
+    get_session, delete_session, get_mac_role, clear_stop_sessions,
 )
+from coa import send_disconnect, send_coa_role_update
+import re
+
+COA_CODE_NAME = {
+    40: "Disconnect-Request",
+    41: "Disconnect-ACK",
+    42: "Disconnect-NAK",
+    43: "CoA-Request",
+    44: "CoA-ACK",
+    45: "CoA-NAK",
+}
 
 s = Settings()
 ensure_dir(s.data_dir)
 init_db(s.db_path)
+prune_sessions(s.db_path, max_age_seconds=24*3600)
 
 app = Flask(__name__)
 
@@ -146,6 +160,22 @@ POST_TO_AP_PAGE = """
       padding: 10px 22px;
       font-size: 16px;
     }
+    a.btnlink {
+      display: inline-block;
+      margin-top: 18px;
+      padding: 10px 22px;
+      font-size: 16px;
+      text-decoration: none;
+      border: 1px solid #bbb;
+      border-radius: 8px;
+      color: #222;
+    }
+    .small {
+      margin-top: 16px;
+      font-size: 12px;
+      color: #666;
+      word-break: break-word;
+    }
   </style>
 </head>
 
@@ -170,11 +200,23 @@ POST_TO_AP_PAGE = """
       <button type="submit">Continue</button>
     </noscript>
   </form>
+  <a class="btnlink" href="{{ success_url }}">Continue</a>
+
+  <div class="small">
+    If you are not redirected automatically, your browser can continue to:<br>
+    <code>{{ success_url }}</code>
+  </div>
 
   <script>
-    // Auto-submit immediately for captive portal flow
+    // Auto-submit immediately for captive portal flow (AP should intercept).
     document.getElementById('loginForm').submit();
+
+    // Fallback: if the captive interception/DNS behaves oddly, try navigating anyway.
+    setTimeout(function () {
+      try { window.location.replace("{{ success_url }}"); } catch (e) {}
+    }, 6000);
   </script>
+
 </body>
 </html>
 """
@@ -183,6 +225,13 @@ ADMIN_PAGE = """
 <!doctype html><meta charset="utf-8">
 <title>ALE Lab Admin</title>
 <body style="font-family:system-ui;max-width:1100px;margin:40px auto;">
+{# <body style="font-family:system-ui;max-width:1600px;margin:24px auto;padding:0 14px;"> #}
+  {% macro token_input() -%}
+    {% if admin_token %}
+      <input type="hidden" name="token" value="{{ admin_token }}">
+    {% endif %}
+  {%- endmacro %}
+
   <style>
     :root { --base-font: 14px; }
 
@@ -197,6 +246,9 @@ ADMIN_PAGE = """
       width: 100%;
       border-collapse: collapse;
     }
+
+    /*table { table-layout: fixed; width: 100%; }*/
+    
     th, td {
       border: 1px solid #333;
       padding: 6px;
@@ -229,6 +281,31 @@ ADMIN_PAGE = """
       font-size: 1em;                        /* IMPORTANT: match table font size */
       line-height: 1.25;
     }
+    td code {
+      font-size: 13px;
+      background: #f6f8fa;
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+    td.session_key, td.acct_id {
+      white-space: normal;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .highlight {
+      outline: 3px solid rgba(255, 193, 7, 0.9);
+      background: rgba(255, 193, 7, 0.18);
+      transition: background 0.6s ease, outline 0.6s ease;
+    }
+    .sess-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      align-items: flex-start;
+    }
+    .sess-actions button {
+      min-width: 92px; /* optional, makes buttons uniform */
+    }
   </style>
 
   <div style="display:flex;align-items:center;gap:18px;margin-bottom:22px;">
@@ -246,7 +323,9 @@ ADMIN_PAGE = """
 
   <form method="post" action="/admin/save-unknown-policy{{ qs }}"
         style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end;margin:10px 0 18px;">
-
+    
+    {{ token_input() }}
+    
     <div style="display:flex;gap:20px;flex-wrap:wrap;align-items:flex-start;margin-bottom:12px;">
       <label style="display:flex;flex-direction:column;gap:6px;min-width:240px;flex:1 1 0;">
         Decision for unknown MACs
@@ -287,21 +366,68 @@ ADMIN_PAGE = """
   </p>
 
   <div style="display:flex;gap:12px;flex-wrap:wrap;margin:10px 0 18px;">
-    <form method="post" action="/admin/expire-cache{{ qs }}"><button type="submit">Expire cache now</button></form>
-    <form method="post" action="/admin/clear-cache{{ qs }}"><button type="submit">Clear cache</button></form>
-    <form method="post" action="/admin/clear-events{{ qs }}"><button type="submit">Clear events</button></form>
+    <form method="post" action="/admin/expire-cache{{ qs }}">
+      {{ token_input() }}
+      <button type="submit">Expire cache now</button>
+    </form>
+    <form method="post" action="/admin/clear-cache{{ qs }}">
+      {{ token_input() }}
+      <button type="submit">Clear cache</button>
+    </form>
+    <form method="post" action="/admin/clear-sessions{{ qs }}">
+      {{ token_input() }}
+      <button type="submit">Clear sessions</button>
+    </form>
+    <form method="post" action="/admin/prune-sessions{{ qs }}">
+      {{ token_input() }}
+      <button type="submit">Prune old sessions</button>
+    </form>
+    <form method="post" action="/admin/clear-stop-sessions{{ qs }}">
+      {{ token_input() }}
+      <button type="submit">Clear STOP sessions</button>
+    </form>
+    <form method="post" action="/admin/clear-events{{ qs }}">
+      {{ token_input() }}
+      <button type="submit">Clear events</button>
+    </form>
   </div>
 
+  <div style="background:#f6f8fa;border:1px solid #ccc;padding:12px;border-radius:6px;margin:16px 0;">
+    <b>MAC lifecycle overview:</b>
+    <ul style="margin:8px 0 0 18px;padding:0;">
+      <li><b>Allowlist</b>: MACs permanently approved to access the network.</li>
+      <li><b>Cache</b>: MACs temporarily allowed (auto-expire).</li>
+      <li><b>MAC Roles (ARP)</b>: Per-MAC access role (Filter-Id) assignments.</li>
+    </ul>
+  </div>
+
+
   <h3>Allowlist ({{ allow|length }})</h3>
-  <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;width:100%;">
-    <tr><th>MAC</th><th>Added (unix)</th><th>Added (local)</th><th>Action</th></tr>
+    <p style="color:#666;margin:4px 0 10px;">
+      MAC addresses that are permanently allowed to authenticate via RADIUS (MAB).
+      Unknown MACs not in this list will be rejected or redirected based on the policy above.
+    </p>
+  
+  <table border="1" cellpadding="6" cellspacing="0"
+         style="border-collapse:collapse;width:100%;">
+         
+    <tr>
+      <th>MAC</th>
+      <th>ARP</th>
+      <th>Added (unix)</th>
+      <th>Added (local)</th>
+      <th>Action</th>
+    </tr>
+    
     {% for r in allow %}
       <tr>
         <td><code>{{ r.mac }}</code></td>
+        <td><code>{{ role_by_mac.get(r.mac, "") }}</code></td>
         <td>{{ r.added_ts }}</td>
         <td class="ts" data-ts="{{ r.added_ts }}"></td>
         <td>
           <form method="post" action="/admin/delete-allow{{ qs }}" style="margin:0;">
+            {{ token_input() }}
             <input type="hidden" name="mac" value="{{ r.mac }}">
             <button type="submit">Remove</button>
           </form>
@@ -312,16 +438,23 @@ ADMIN_PAGE = """
   </table>
 
   <h3 style="margin-top:26px;">Cache ({{ cache|length }})</h3>
+    <p style="color:#666;margin:4px 0 10px;">
+      Temporary allowlist used to avoid repeated portal redirects and re-authentication.
+      Entries expire automatically after a TTL.
+    </p>
+
   <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;width:100%;">
-    <tr><th>MAC</th><th>Expires (unix)</th><th>Expires (local)</th><th>Action</th></tr>
+    <tr><th>MAC</th><th>ARP</th><th>Expires (unix)</th><th>Expires (local)</th><th>Action</th></tr>
     {% for r in cache %}
       <tr>
         <td><code>{{ r.mac }}</code></td>
+        <td><code>{{ role_by_mac.get(r.mac, "") }}</code></td>
         <td>{{ r.expires_ts }}</td>
         <td class="ts {% if r.expires_ts and r.expires_ts < now_ts %}expired{% endif %}"
             data-ts="{{ r.expires_ts }}"></td>
         <td>
           <form method="post" action="/admin/delete-cache{{ qs }}" style="margin:0;">
+            {{ token_input() }}
             <input type="hidden" name="mac" value="{{ r.mac }}">
             <button type="submit">Remove</button>
           </form>
@@ -330,15 +463,109 @@ ADMIN_PAGE = """
     {% endfor %}
   </table>
 
+  <h3 style="margin-top:26px;">MAC Roles (ARP) ({{ roles|length }})</h3>
+    <p style="color:#666;margin:4px 0 10px;">
+      Per-MAC Access Role Profile (Filter-Id) assignments.
+      This determines the policy, VLAN, ACLs, and privileges applied by the AP.
+    </p>
+
+    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;width:100%;">
+      <tr><th>MAC</th><th>ARP</th><th>Updated (unix)</th><th>Updated (local)</th><th>Action</th></tr>
+      {% for r in roles %}
+        <tr>
+          <td><code>{{ r.mac }}</code></td>
+          <td><code>{{ r.arp }}</code></td>
+          <td>{{ r.updated_ts }}</td>
+          <td class="ts" data-ts="{{ r.updated_ts }}"></td>
+          <td>
+            <form method="post" action="/admin/delete-role{{ qs }}" style="margin:0;">
+              {{ token_input() }}
+              <input type="hidden" name="mac" value="{{ r.mac }}">
+              <button type="submit">Remove</button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+    </table>
+
+  <h3 style="margin-top:26px;">Sessions (latest 50)</h3>
+  <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;width:100%;">
+    <tr>
+      <th>last seen (unix)</th><th>last seen (local)</th>
+      <th>status</th>
+      <th>MAC</th>
+      <th>Framed IP</th>
+      <th>NAS IP</th>
+      <th>Acct-Session-Id</th>
+      <th>SSID</th>
+      <th>session_key</th>
+      <th>Action</th>
+    </tr>
+    {% for srow in sessions %}
+      <tr data-session-key="{{ srow.session_key }}">
+        <td>{{ srow.last_seen_ts }}</td>
+        <td class="ts" data-ts="{{ srow.last_seen_ts }}"></td>
+        <td><code>{{ srow.status }}</code></td>
+        <td><code>{{ srow.mac }}</code></td>
+        <td><code>{{ srow.framed_ip }}</code></td>
+        <td><code>{{ srow.nas_ip or srow.src_ip }}</code></td>
+        <td class="acct_id"><code>{{ srow.acct_session_id }}</code></td>
+        <td><code>{{ srow.ssid }}</code></td>
+        <td class="session_key"><code>{{ srow.session_key }}</code></td>
+        <td style="white-space:normal;">
+          <div class="sess-actions">
+            <form method="post" action="/admin/delete-session{{ qs }}" style="margin:0;">
+              {{ token_input() }}
+              <input type="hidden" name="session_key" value="{{ srow.session_key }}">
+              <button type="submit">Delete</button>
+            </form>
+          
+            <form method="post" action="/admin/disconnect-session{{ qs }}" style="margin:0;">
+              {{ token_input() }}
+              <input type="hidden" name="session_key" value="{{ srow.session_key }}">
+              <button type="submit">Disconnect</button>
+            </form>
+          
+            <form method="post" action="/admin/coa-role{{ qs }}" style="margin:0;">
+              {{ token_input() }}
+              <input type="hidden" name="session_key" value="{{ srow.session_key }}">
+
+              <div style="display:flex;gap:6px;align-items:center;">
+                <input name="role" placeholder="ARP" style="width:100px;">
+                <button type="submit">CoA Role</button>
+              </div>
+            </form>
+          </div>
+        </td>
+      </tr>
+    {% endfor %}
+  </table>
+
   <h3 style="margin-top:26px;">Recent Events ({{ events|length }})</h3>
   <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;width:100%;">
-    <tr><th>ts (unix)</th><th>ts (local)</th><th>source</th><th>type</th><th>mac</th><th>ip</th><th class="detail">detail</th></tr>
+    <tr>
+      <th>ts (unix)</th>
+      <th>ts (local)</th>
+      <th>event-ts (unix)</th>
+      <th>event-ts (local)</th>
+      <th>source</th>
+      <th>type</th>
+      <th>mac</th>
+      <th>ip</th>
+      <th>detail</th>
+    </tr>
     {% for e in events %}
       <tr>
         <td>{{ e.ts }}</td>
         <td class="ts" data-ts="{{ e.ts }}"></td>
+        <td>
+          {% if e.detail_obj and e.detail_obj.event_timestamp %}
+            {{ e.detail_obj.event_timestamp }}
+          {% endif %}
+        </td>
+        <td class="ts" data-ts="{% if e.detail_obj and e.detail_obj.event_timestamp %}{{ e.detail_obj.event_timestamp }}{% endif %}"></td>
         <td>{{ e.source }}</td>
-        <td><code>{{ e.type }}</code></td>
+        <td><code>{% if e.dir %}{{ e.dir }} {% endif %}{{ e.type }}</code></td>
         <td><code>{{ e.mac }}</code></td>
         <td><code>{{ e.ip }}</code></td>
         <td class="detail"><code>{{ e.detail }}</code></td>
@@ -370,9 +597,41 @@ ADMIN_PAGE = """
       });
     })();
   </script>
+  <script>
+    (function () {
+      const params = new URLSearchParams(window.location.search);
+      const hi = params.get("hi");
+      if (!hi) return;
+
+      // Find the session row
+      const row = document.querySelector(`tr[data-session-key="${CSS.escape(hi)}"]`);
+      if (!row) return;
+
+      row.classList.add("highlight");
+      row.scrollIntoView({ behavior: "smooth", block: "center" });
+
+      // Remove highlight after a few seconds
+      setTimeout(() => row.classList.remove("highlight"), 3500);
+
+      // Optional: remove hi= from URL so refresh doesn't re-highlight
+      params.delete("hi");
+      const newQs = params.toString();
+      const newUrl = window.location.pathname + (newQs ? "?" + newQs : "");
+      window.history.replaceState({}, "", newUrl);
+    })();
+  </script>
   
 </body>
 """
+
+def _require_admin_token_or_403():
+    token_cfg = (getattr(s, "admin_token", "") or "").strip()
+    if not token_cfg:
+        return  # token disabled (lab mode)
+
+    token_req = (request.args.get("token") or request.form.get("token") or "").strip()
+    if token_req != token_cfg:
+        abort(403)
 
 def prettify_errmsg(msg: str) -> str:
     msg = (msg or "").strip()
@@ -409,6 +668,36 @@ def admin_ok() -> bool:
     if not token:
         return True  # lab mode: open
     return request.args.get("token", "") == token
+
+def _admin_qs_or_403():
+    """
+    Return "?token=..." (or "") for admin redirects and action URLs.
+    Enforces token if s.admin_token is set.
+    """
+    token_cfg = (getattr(s, "admin_token", "") or "").strip()
+    token_req = (request.args.get("token") or "").strip()
+
+    if token_cfg:
+        if token_req != token_cfg:
+            return None  # caller returns 403
+        return "?token=" + token_req
+
+    return ""
+
+def _admin_qs():
+    """Return '?token=...' if token is present, else ''."""
+    token = (request.args.get("token") or "").strip()
+    return f"?token={token}" if token else ""
+
+def _admin_redirect(hi: str | None = None):
+    """Redirect to /admin preserving token, optionally adding hi=..."""
+    qs = _admin_qs()
+    base = "/admin" + qs
+    if hi:
+        sep = "&" if "?" in base else "?"
+        base = f"{base}{sep}hi={quote(hi)}"
+    return ("", 303, {"Location": base})
+
 
 @app.get("/login/ale")
 def login_ale():
@@ -512,6 +801,10 @@ def register():
     if not mac12:
         return "Missing/invalid clientmac (AP didn’t send one we can parse).", 400
 
+    if arp:
+        set_mac_role(s.db_path, mac12, arp)
+        log_event(s.db_path, "portal", "set_role", mac=mac12, ip=clientip, detail={"arp": arp})
+
     # Compute effective URLs BEFORE logging them
     success_url = url_override or url or "http://example.com/"
 
@@ -530,7 +823,13 @@ def register():
     # Now logging is safe
     log_event(
         s.db_path, "portal", "register", mac=mac12, ip=clientip,
-        detail={"ssid": ssid, "email": email, "success_url": success_url, "onerror_url": onerror_url}
+        detail={
+            "ssid": ssid,
+            "email": email,
+            "success_url": success_url,
+            "onerror_url": onerror_url,
+            "arp": arp,
+        }
     )
     log_jsonl(s.portal_log_jsonl, {
         "event": "register",
@@ -568,40 +867,69 @@ def register():
 
 @app.get("/admin")
 def admin():
-    if not admin_ok():
-        return "Forbidden", 403
+    _require_admin_token_or_403()
 
     allow = list_allow_macs(s.db_path, limit=500)
     cache = list_cache(s.db_path, limit=500)
     events = list_events(s.db_path, limit=200)
+    # Convert sqlite3.Row -> dict so we can safely modify fields
+    events = [dict(r) for r in events]
     unknown_policy = get_setting(s.db_path, "unknown_policy", s.unknown_mac_policy_default)
     unknown_arp    = get_setting(s.db_path, "unknown_arp", s.unknown_mac_arp_default)
     portal_base    = get_setting(s.db_path, "portal_base", s.portal_public_base_url)
+    roles = list_mac_roles(s.db_path, limit=500)
+    role_by_mac = {r["mac"]: r["arp"] for r in roles}
+    hi = (request.args.get("hi", "") or "").strip()
 
 
     # preserve token in action URLs
-    token = request.args.get("token", "")
-    qs = f"?token={token}" if token else ""
+    qs = _admin_qs()
+    admin_token = (request.args.get("token") or "").strip()
 
-    # Pretty-print JSON details for admin UI readability
+    sessions = list_sessions(s.db_path, limit=50)
+
+    # Pretty-print JSON details for admin UI readability (+ enrich CoA/DM rx/tx)
     for e in events:
-        if not e.get("detail"):
-            continue
+        e["dir"] = ""
         try:
-            parsed = json.loads(e["detail"])
-            e["detail"] = json.dumps(parsed, indent=2, ensure_ascii=False)
+            d = json.loads(e["detail"]) if isinstance(e["detail"], str) else (e["detail"] or {})
+            e["dir"] = d.get("dir", "") or ""
+
+            # --- Add readable labels for CoA/DM codes ---
+            if isinstance(d, dict):
+                tx = d.get("tx") or {}
+                rx = d.get("rx") or {}
+
+                # request_code label
+                if isinstance(tx, dict):
+                    code = tx.get("request_code")
+                    if isinstance(code, int):
+                        tx["request_code_label"] = f"{code} ({COA_CODE_NAME.get(code, '')})".strip()
+
+                # reply_code label
+                if isinstance(rx, dict):
+                    code = rx.get("reply_code")
+                    if isinstance(code, int):
+                        rx["reply_code_label"] = f"{code} ({COA_CODE_NAME.get(code, '')})".strip()
+
+            e["detail"] = json.dumps(d, indent=2, ensure_ascii=False)
         except Exception:
-            # Not JSON → leave as-is
             pass
+
 
     return render_template_string(
         ADMIN_PAGE,
+        roles=roles,
+        role_by_mac=role_by_mac,
         s=s,
         db_path=s.db_path,
         allow=allow,
         cache=cache,
         events=events,
+        sessions=sessions,
         qs=qs,
+        hi=hi,
+        admin_token=admin_token,
         now_ts=int(time.time()),
         unknown_policy=unknown_policy,
         unknown_arp=unknown_arp,
@@ -610,56 +938,53 @@ def admin():
 
 @app.post("/admin/delete-allow")
 def admin_delete_allow():
-    if not admin_ok():
-        return "Forbidden", 403
+    _require_admin_token_or_403()
+    
     mac = request.form.get("mac", "")
     delete_allow_mac(s.db_path, mac)
     # also drop from cache so it really re-portals
     delete_cache_mac(s.db_path, mac)
     log_event(s.db_path, "admin", "delete_allow", mac=normalize_mac_any(mac), detail={"mac": mac})
-    token = request.args.get("token", "")
-    return ("" , 302, {"Location": "/admin" + (f"?token={token}" if token else "")})
+    return _admin_redirect()
 
 @app.post("/admin/delete-cache")
 def admin_delete_cache():
-    if not admin_ok():
-        return "Forbidden", 403
+    _require_admin_token_or_403()
+    
     mac = request.form.get("mac", "")
     delete_cache_mac(s.db_path, mac)
     log_event(s.db_path, "admin", "delete_cache", mac=normalize_mac_any(mac), detail={"mac": mac})
-    token = request.args.get("token", "")
-    return ("" , 302, {"Location": "/admin" + (f"?token={token}" if token else "")})
+    return _admin_redirect()
 
 @app.post("/admin/clear-cache")
 def admin_clear_cache():
-    if not admin_ok():
-        return "Forbidden", 403
+    _require_admin_token_or_403()
+    
     clear_cache(s.db_path)
     log_event(s.db_path, "admin", "clear_cache")
-    token = request.args.get("token", "")
-    return ("" , 302, {"Location": "/admin" + (f"?token={token}" if token else "")})
+    return _admin_redirect()
 
 @app.post("/admin/clear-events")
 def admin_clear_events():
-    if not admin_ok():
-        return "Forbidden", 403
+    _require_admin_token_or_403()
+    
     clear_events(s.db_path)
     log_event(s.db_path, "admin", "clear_events")
-    token = request.args.get("token", "")
-    return ("" , 302, {"Location": "/admin" + (f"?token={token}" if token else "")})
+    return _admin_redirect()
 
 @app.post("/admin/expire-cache")
 def admin_expire_cache():
-    if not admin_ok():
-        return "Forbidden", 403
+    _require_admin_token_or_403()
+    
     expire_cache_now(s.db_path)
     log_event(s.db_path, "admin", "expire_cache_now")
-    token = request.args.get("token", "")
-    return ("", 302, {"Location": "/admin" + (f"?token={token}" if token else "")})
+    return _admin_redirect()
 
 @app.post("/admin/save-unknown-policy")
 def admin_save_unknown_policy():
     # if you have admin token enforcement, apply it here too (same as other admin POSTs)
+    _require_admin_token_or_403()
+    
     policy = (request.form.get("unknown_policy", "") or "").strip().lower()
     arp    = (request.form.get("unknown_arp", "") or "").strip()
     pbase  = (request.form.get("portal_base", "") or "").strip().rstrip("/")
@@ -673,8 +998,210 @@ def admin_save_unknown_policy():
 
     log_event(s.db_path, "portal", "admin_set_unknown_policy",
               detail={"unknown_policy": policy, "unknown_arp": arp, "portal_base": pbase})
+    return _admin_redirect()
 
-    return ("", 303, {"Location": "/admin"})
+@app.post("/admin/delete-role")
+def admin_delete_role():
+    _require_admin_token_or_403()
+    
+    mac = request.form.get("mac", "")
+    mac12 = normalize_mac_any(mac)
+    if mac12:
+        delete_mac_role(s.db_path, mac12)
+        log_event(s.db_path, "portal", "admin_delete_role", mac=mac12, detail={})
+    return _admin_redirect()
+
+@app.post("/admin/clear-sessions")
+def admin_clear_sessions():
+    _require_admin_token_or_403()
+    clear_sessions(s.db_path)
+    log_event(s.db_path, "portal", "admin_clear_sessions")
+    return _admin_redirect()
+
+
+@app.post("/admin/prune-sessions")
+def admin_prune_sessions():
+    _require_admin_token_or_403()
+    prune_sessions(s.db_path, max_age_seconds=24*3600)
+    log_event(s.db_path, "portal", "admin_prune_sessions")
+    return _admin_redirect()
+
+@app.post("/admin/clear-stop-sessions")
+def admin_clear_stop_sessions():
+    _require_admin_token_or_403()
+
+    n = clear_stop_sessions(s.db_path)
+    log_event(s.db_path, "portal", "admin_clear_stop_sessions", detail={"deleted": n})
+
+    return _admin_redirect()
+
+
+@app.post("/admin/disconnect-session")
+def admin_disconnect_session():
+    _require_admin_token_or_403()
+    
+    clicked_by = request.remote_addr or ""
+    session_key = (request.form.get("session_key", "") or "").strip()
+    row = get_session(s.db_path, session_key)
+    if not row:
+        return "Unknown session_key", 404
+
+    # Choose NAS target: prefer NAS-IP-Address; fallback to src_ip
+    nas_ip = (row["nas_ip"] or row["src_ip"] or "").strip()
+    if not nas_ip:
+        return "Cannot determine NAS IP for CoA/DM (missing nas_ip/src_ip).", 400
+
+    log_event(
+        s.db_path,
+        "radius",
+        "dm_tx",
+        mac=row["mac"],
+        ip=row["framed_ip"],
+        detail={
+            "dir": "<-",  # RADIUS -> AP (as you requested)
+            "nas_ip": nas_ip,
+            "coa_port": getattr(s, "coa_port", 3799),
+            "session_key": session_key,
+            "calling_station_id": row["calling_station_id"] or row["mac"],
+            "acct_session_id": row["acct_session_id"] or "",
+            "framed_ip": row["framed_ip"] or "",
+            "nas_id": row["nas_id"] or "",
+            "clicked_by": clicked_by,
+        },
+    )
+
+    ok, info = send_disconnect(
+        nas_ip=nas_ip,
+        secret=s.coa_secret,
+        dictionary_path=s.radius_dictionary_path,
+        calling_station_id=row["calling_station_id"] or row["mac"],
+        acct_session_id=row["acct_session_id"] or "",
+        framed_ip=row["framed_ip"] or "",
+        nas_identifier=row["nas_id"] or "",
+        timeout=getattr(s, "coa_timeout_seconds", 2),
+        coa_port=getattr(s, "coa_port", 3799),
+    )
+    
+    if isinstance(info, dict) and "tx" in info and ok:
+        info = {"rx": info.get("rx", {}), "tx_note": "see dm_tx"}
+
+
+    log_event(
+        s.db_path,
+        "radius",
+        "dm_rx",
+        mac=row["mac"],
+        ip=row["framed_ip"],
+        detail={
+            "dir": "->",  # AP -> RADIUS (reply)
+            "ok": ok,
+            "session_key": session_key,
+            **(info if isinstance(info, dict) else {"info": str(info)}),
+            "clicked_by": clicked_by,
+        },
+    )
+    
+    if not ok:
+        log_event(
+            s.db_path, "radius", "dm_error",
+            mac=row["mac"], ip=row["framed_ip"],
+            detail={"dir": "->", "session_key": session_key, **(info if isinstance(info, dict) else {"info": str(info)})},
+        )
+    return _admin_redirect(hi=session_key)
+
+@app.post("/admin/delete-session")
+def admin_delete_session():
+    _require_admin_token_or_403()
+    
+    session_key = (request.form.get("session_key", "") or "").strip()
+    delete_session(s.db_path, session_key)
+    log_event(s.db_path, "portal", "admin_delete_session", detail={"session_key": session_key})
+    return _admin_redirect(hi=session_key)
+
+@app.post("/admin/coa-role")
+def admin_coa_role():
+    _require_admin_token_or_403()
+    
+    session_key = (request.form.get("session_key", "") or "").strip()
+    role = (request.form.get("role", "") or "").strip()
+    clicked_by = request.remote_addr or ""
+    row = get_session(s.db_path, session_key)
+    if not row:
+        return "Unknown session_key", 404
+
+    nas_ip = (row["nas_ip"] or row["src_ip"] or "").strip()
+    if not nas_ip:
+        return "Cannot determine NAS IP for CoA (missing nas_ip/src_ip).", 400
+
+    # If role not provided, try DB role per MAC; else fallback to Settings default
+    if not role:
+        try:
+            role = (get_mac_role(s.db_path, row["mac"]) or "").strip()
+        except Exception:
+            role = ""
+    if not role:
+        role = (getattr(s, "role_final", "") or "").strip()  # your default final ARP/role
+
+    # Add the username so we can add it in the CoA.
+    # Stellar APs expect "username" among other attributes
+    user_name = row["calling_station_id"] or row["mac"]
+    
+    calling_station_id = row["calling_station_id"] or row["mac"]
+    # Convert 12-hex to colon format if needed
+    if len(calling_station_id) == 12 and ":" not in calling_station_id:
+        calling_station_id = ":".join(calling_station_id[i:i+2] for i in range(0, 12, 2))
+    
+    # TX log: RADIUS -> AP
+    log_event(
+        s.db_path,
+        "radius",
+        "coa_tx",
+        mac=row["mac"],
+        ip=row["framed_ip"],
+        detail={
+            "dir": "<-",
+            "clicked_by": clicked_by,
+            "session_key": session_key,
+            "nas_ip": nas_ip,
+            "coa_port": getattr(s, "coa_port", 3799),
+            "ARP": role,
+            "calling_station_id": row["calling_station_id"] or row["mac"],
+            "acct_session_id": row["acct_session_id"] or "",
+            "framed_ip": row["framed_ip"] or "",
+            "nas_id": row["nas_id"] or "",
+        },
+    )
+
+    ok, info = send_coa_role_update(
+        nas_ip=nas_ip,
+        secret=s.coa_secret,
+        dictionary_path=s.radius_dictionary_path,
+        role_filter_id=role,
+        user_name=user_name,
+        calling_station_id=calling_station_id,
+        acct_session_id=row["acct_session_id"] or "",
+        framed_ip=row["framed_ip"] or "",
+        nas_identifier=row["nas_id"] or "",
+        timeout=getattr(s, "coa_timeout_seconds", 2),
+        coa_port=getattr(s, "coa_port", 3799),
+    )
+
+    # RX log: AP -> RADIUS
+    log_event(
+        s.db_path,
+        "radius",
+        "coa_rx",
+        mac=row["mac"],
+        ip=row["framed_ip"],
+        detail={
+            "dir": "->",
+            "clicked_by": clicked_by,
+            "ok": ok,
+            "session_key": session_key,
+            **(info if isinstance(info, dict) else {"info": str(info)}),
+        },
+    )
+    return _admin_redirect(hi=session_key)
 
 if __name__ == "__main__":
     app.run(

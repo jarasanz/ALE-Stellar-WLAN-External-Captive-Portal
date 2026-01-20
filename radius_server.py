@@ -7,7 +7,7 @@ from config import Settings
 from db import (
     ensure_dir, init_db, normalize_mac_any,
     allowed_decision, allow_and_cache, log_event,
-    get_setting, get_mac_role,
+    get_setting, get_mac_role, upsert_session,
 )
 import re
 import traceback
@@ -98,8 +98,86 @@ def parse_called_station_id(called: str) -> tuple[str, str]:
 def _pick_arp_for_mac(db_path: str, mac12: str, default_role: str) -> str:
     arp = (get_mac_role(db_path, mac12) or default_role or "").strip()
     if arp and not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", arp):
+        log_event(s.db_path, "radius", "invalid_arp", mac=mac12, detail={"arp": arp})
         return ""
     return arp
+
+def _safe_str(v) -> str:
+    """Best-effort stringify for pyrad values (bytes, ints, etc.)."""
+    if v is None:
+        return ""
+    if isinstance(v, bytes):
+        try:
+            return v.decode("utf-8", "replace")
+        except Exception:
+            return repr(v)
+    return str(v)
+
+def radius_attrs_to_dict(pkt) -> dict:
+    """
+    Dump ALL RADIUS attributes to a JSON-friendly dict.
+    pyrad packet stores values as lists, but we collapse singletons.
+    """
+    out = {}
+    for k in pkt.keys():
+        try:
+            vals = pkt.get(k, [])
+            if not isinstance(vals, list):
+                vals = [vals]
+            clean = [_safe_str(v) for v in vals]
+            out[str(k)] = clean[0] if len(clean) == 1 else clean
+        except Exception as e:
+            out[str(k)] = f"<decode-error:{e}>"
+    return out
+
+def _safe_int(v):
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+import struct
+
+def _to_int(v):
+    """Decode RADIUS 'integer' values that may arrive as int/str/bytes."""
+    if v is None:
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, (bytes, bytearray)):
+        # RADIUS integer is 4 bytes, network order
+        if len(v) == 4:
+            return struct.unpack("!I", bytes(v))[0]
+        # fallback: best effort
+        return int.from_bytes(bytes(v), byteorder="big", signed=False)
+    if isinstance(v, str):
+        v = v.strip()
+        if v.isdigit():
+            return int(v)
+    return None
+
+
+ACCT_STATUS_MAP = {
+    1: "Start", "1": "Start",
+    2: "Stop", "2": "Stop",
+    3: "Interim-Update", "3": "Interim-Update",
+    7: "Accounting-On", "7": "Accounting-On",
+    8: "Accounting-Off", "8": "Accounting-Off",
+}
+ACCT_TERMINATE_CAUSE = {
+    1: "User-Request", "1": "User-Request",
+    2: "Lost-Carrier", "2": "Lost-Carrier",
+    3: "Lost-Service", "3": "Lost-Service",
+    4: "Idle-Timeout", "4": "Idle-Timeout",
+    5: "Session-Timeout", "5": "Session-Timeout",
+    6: "Admin-Reset", "6": "Admin-Reset",
+    7: "Admin-Reboot", "7": "Admin-Reboot",
+    8: "Port-Error", "8": "Port-Error",
+    9: "NAS-Error", "9": "NAS-Error",
+    10: "NAS-Request", "10": "NAS-Request",
+    11: "NAS-Reboot", "11": "NAS-Reboot",
+    12: "Port-Unneeded", "12": "Port-Unneeded",
+}
 
 class ALEStellarRadius(Server):
     def send_accept(self, pkt, mac12: str, filter_id: str = "", redirect_url: str = ""):
@@ -360,41 +438,156 @@ class ALEStellarRadius(Server):
         self.SendReplyPacket(pkt.fd, reply)
 
     def HandleAcctPacket(self, pkt):
-        # Memo says standard accounting (Start/Interim/Stop), and provides formats.
-        # We’ll just log it.
+        # Full attribute-level accounting logging (Start/Interim/Stop + vendor attrs)
         mac12 = extract_mac_from_radius(pkt)
-        framed_ip = str(pkt.get("Framed-IP-Address", [""])[0] or "")
-        status = str(pkt.get("Acct-Status-Type", [""])[0] or "")
-        user = str(pkt.get("User-Name", [""])[0] or "")
+        framed_ip = _safe_str(pkt.get("Framed-IP-Address", [""])[0] if pkt.get("Framed-IP-Address") else "")
+        status = _safe_str(pkt.get("Acct-Status-Type", [""])[0] if pkt.get("Acct-Status-Type") else "")
+        status_name = ACCT_STATUS_MAP.get(status, status)
+        user = _safe_str(pkt.get("User-Name", [""])[0] if pkt.get("User-Name") else "")
+
+        called = _safe_str(pkt.get("Called-Station-Id", [""])[0] if pkt.get("Called-Station-Id") else "")
+        if not called:
+            called = _safe_str(pkt.get("Called-Station-ID", [""])[0] if pkt.get("Called-Station-ID") else "")
+        ap_mac12, ssid = parse_called_station_id(called)
+
+        calling = _safe_str(pkt.get("Calling-Station-Id", [""])[0] if pkt.get("Calling-Station-Id") else "")
+        if not calling:
+            calling = _safe_str(pkt.get("Calling-Station-ID", [""])[0] if pkt.get("Calling-Station-ID") else "")
+
+        acct_session_id = _safe_str(pkt.get("Acct-Session-Id", [""])[0] if pkt.get("Acct-Session-Id") else "")
+        if not acct_session_id:
+            acct_session_id = _safe_str(pkt.get("Acct-Session-ID", [""])[0] if pkt.get("Acct-Session-ID") else "")
+
+        acct_multi_session_id = _safe_str(pkt.get("Acct-Multi-Session-Id", [""])[0] if pkt.get("Acct-Multi-Session-Id") else "")
+        if not acct_multi_session_id:
+            acct_multi_session_id = _safe_str(pkt.get("Acct-Multi-Session-ID", [""])[0] if pkt.get("Acct-Multi-Session-ID") else "")
+
         nas = extract_nas_fields(pkt)
         src_ip = getattr(pkt, "src_ip", "")
-        
-        # dict for logs
+
+        # Full raw attribute dump
+        attrs = radius_attrs_to_dict(pkt)
+        raw_evt_ts = attrs.get("Event-Timestamp")
+        event_ts = _safe_int(raw_evt_ts)
+        term_raw = attrs.get("Acct-Terminate-Cause") or attrs.get("49")
+        term_code = _to_int(term_raw)
+        term_name = ACCT_TERMINATE_CAUSE.get(term_code, "") if term_code is not None else ""
+
+        # --- Session tracking for CoA / admin UI (upsert) ---
+        # Normalize status to start/interim/stop
+        status_norm = "interim"
+        if status_name.lower().startswith("start"):
+            status_norm = "start"
+        elif status_name.lower().startswith("stop"):
+            status_norm = "stop"
+
+        # Choose event timestamp
+        now_ts = int(time.time())
+        ts_effective = event_ts or now_ts
+
+        # Pick a stable session key:
+        # Prefer Acct-Session-Id; fallback to Multi-Session-Id; else a synthetic key
+        session_key = ""
+        if acct_session_id:
+            session_key = acct_session_id
+        elif acct_multi_session_id:
+            session_key = acct_multi_session_id
+        else:
+            # last-resort: still lets you track "a session-ish thing" for testing
+            # (we can refine later if your AP always omits acct ids)
+            session_key = f"{src_ip}:{mac12}:{ssid}:{ts_effective}"
+
+        start_ts = ts_effective if status_norm == "start" else None
+        stop_ts  = ts_effective if status_norm == "stop" else None
+
+        upsert_session(
+            s.db_path,
+            session_key = acct_session_id + "|" + mac12,
+            acct_session_id=acct_session_id,
+            acct_multi_session_id=acct_multi_session_id,
+            mac=mac12,
+            calling_station_id=calling,
+            nas_ip=nas.get("nas_ip", ""),
+            nas_id=nas.get("nas_id", ""),
+            src_ip=src_ip,
+            framed_ip=framed_ip,
+            ap_mac=ap_mac12,
+            ssid=ssid,
+            status=status_norm,
+            start_ts=start_ts,
+            stop_ts=stop_ts,
+            raw={
+                # keep it compact but useful; you already store full attrs in events
+                "event_timestamp": event_ts,
+                "status": status,
+                "status_name": status_name,
+                "terminate_cause": term_code,
+                "terminate_cause_name": term_name,
+            },
+        )
+
+
+        # Friendly/enriched log object
         detail = {
             "phase": "acct",
             "src_ip": src_ip,
+
+            # common / helpful fields
+            "status": status,
+            "status_name": status_name,
+            "event_timestamp": event_ts,
+            "terminate_cause": term_code,
+            "terminate_cause_name": term_name,
             "user": user,
+            "mac": mac12,
+            "calling_station_id": calling,
+            "called_station_id": called,
+            "ap_mac": ap_mac12,
+            "ssid": ssid,
+            "framed_ip": framed_ip,
+            "acct_session_id": acct_session_id,
+            "acct_multi_session_id": acct_multi_session_id,
+            "dir": "->",  # AP -> RADIUS
+
+            # NAS identity
             **nas,
+
+            # full packet dump (everything)
+            "attrs": attrs,
         }
 
+        # Use a consistent event type; keep status as a field
+        # (This prevents lots of “acct_<random>” event types when vendor strings appear)
         log_event(
-            s.db_path, 
-            "radius", 
-            f"acct_{status}".lower(), 
-            mac=mac12, 
-            ip=framed_ip, 
-            detail=detail
+            s.db_path,
+            "radius",
+            "acct_packet",
+            mac=mac12,
+            ip=framed_ip,
+            detail=detail,
         )
+
         log_jsonl(
             s.radius_log_jsonl,
             {
-                "event":"acct",
-                "status":status,
-                "mac":mac12,
-                "ip":framed_ip,
+                "event": "acct_packet",
+                "status": status,
+                "status_name": status_name,
+                "event_timestamp": event_ts,
+                "terminate_cause": term_code,
+                "terminate_cause_name": term_name,
+                "mac": mac12,
+                "ip": framed_ip,
                 "src_ip": src_ip,
-                "user":user, 
-                **nas
+                "user": user,
+                "calling_station_id": calling,
+                "called_station_id": called,
+                "ap_mac": ap_mac12,
+                "ssid": ssid,
+                "acct_session_id": acct_session_id,
+                "acct_multi_session_id": acct_multi_session_id,
+                 **nas,
+                "attrs": attrs,
             },
         )
 
